@@ -1,0 +1,532 @@
+//@version=6
+strategy("Streak Failure Reversal [Herman]", overlay = true, pyramiding = 0, initial_capital = 5000, currency = currency.USD, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 1.0, slippage = 1, margin_long = 0, margin_short = 0, process_orders_on_close = false, calc_on_order_fills = true, calc_on_every_tick = false, max_bars_back = 500)
+
+// ============================================================================
+// EXECUTION CONTRACT
+// ============================================================================
+// Chart: standard 1-minute candles. Signal TF: 1 or 5 minutes.
+// A completed bullish streak arms a SHORT, not a LONG.
+// SHORT trigger: a later confirmed signal candle CLOSES below the terminal
+// streak candle's LOW. LONG is the exact mirror. Wicks alone do not trigger.
+// Window: candles 1..waitBars AFTER the setup candle; the last candle is valid.
+// Entry: market on the next available chart-bar open, with simulated slippage.
+// One position at a time; no pyramiding, trailing stop or breakeven.
+//
+// Default streak definition uses bullish / bearish candle bodies.
+// Higher/lower-close mode remains available as an alternative setting.
+//
+// IMPORTANT FIXES:
+// - A fill execution manages orders only; it cannot create a new setup/entry.
+// - Each signal candle is processed once, at its actual closing boundary.
+// - SL/TP initialise once per filled entry, NOT with position_size[1].
+// - Setup age is a difference of signal-bar indices, not an execution counter.
+// - Intrabar-persistent state survives entry+exit on the same chart candle.
+// - A submitted but unfilled market order cannot block all subsequent trades.
+//
+// Deep Backtesting's report and the on-chart table are DIFFERENT runs.
+// The table describes the chart-loaded run; it cannot read the Deep report.
+//
+// Margin=0 disables margin checks for research; it is NOT a real broker margin
+// model. The sizing budget is an estimate of nominal stop risk, not a guarantee
+// of maximum realised loss. Gaps, costs and slippage can increase loss.
+// No market-data backtest or TradingView compilation is claimed by this file.
+
+// ============================== SETTINGS ===================================
+string G1 = "01 - Setup and confirmation"
+string signalMode = input.string("1 minute", "Signal timeframe", options = ["1 minute", "5 minutes"], group = G1)
+string streakDefinition = input.string("Bullish / bearish candle bodies", "Streak definition", options = ["Higher / lower closes", "Bullish / bearish candle bodies"], group = G1, tooltip = "Higher/lower closes compares CLOSE to the previous CLOSE. Candle bodies compares CLOSE to OPEN. Default is bullish / bearish candle bodies.")
+int streakLen = input.int(5, "Consecutive candles", minval = 2, maxval = 20, group = G1)
+int waitBars = input.int(15, "Confirmation window - subsequent signal candles", minval = 1, maxval = 100, group = G1)
+bool allowLongs = input.bool(true, "Enable LONG reversals", group = G1)
+bool allowShorts = input.bool(true, "Enable SHORT reversals", group = G1)
+
+string G2 = "02 - Session (America/New_York)"
+bool useSessionFilter = input.bool(true, "Enable session filter", group = G2)
+int sessionStartHour = input.int(9, "Session start hour", minval = 0, maxval = 23, group = G2)
+int sessionStartMinute = input.int(45, "Session start minute", minval = 0, maxval = 59, group = G2)
+int sessionEndHour = input.int(12, "Session end hour", minval = 0, maxval = 23, group = G2)
+int sessionEndMinute = input.int(0, "Session end minute", minval = 0, maxval = 59, group = G2)
+bool triggerMustBeInSession = input.bool(true, "Confirmation must also be in session", group = G2, tooltip = "Ignored when Enable session filter is OFF. Setup completion is filtered by its closing timestamp; the streak may begin before the session.")
+bool hardFlatEnabled = input.bool(true, "Daily hard flat", group = G2)
+int hardFlatHour = input.int(16, "Hard-flat hour", minval = 0, maxval = 23, group = G2)
+int hardFlatMinute = input.int(0, "Hard-flat minute", minval = 0, maxval = 59, group = G2)
+
+string G3 = "03 - Stop loss"
+string slMode = input.string("Terminal streak candle extreme", "SL method", options = ["Trigger candle extreme", "Terminal streak candle extreme", "Whole streak extreme", "Whole move through trigger", "ATR from trigger close"], group = G3, tooltip = "For SHORT: high of the trigger candle / terminal streak candle / original streak / move from the streak through the trigger. LONG uses corresponding lows.")
+int stopBufferTicks = input.int(0, "SL buffer in ticks", minval = 0, maxval = 100, group = G3)
+int atrLen = input.int(14, "ATR period - SMA of True Range", minval = 1, maxval = 200, group = G3)
+float atrMult = input.float(1.0, "ATR multiplier", minval = 0.1, step = 0.1, group = G3)
+
+string G4 = "04 - Take profit"
+string tpMode = input.string("R multiple", "TP method", options = ["R multiple", "First streak candle extreme", "First streak candle open"], group = G4)
+float tpR = input.float(1.0, "R multiple", minval = 0.25, step = 0.25, group = G4, tooltip = "Computed from actual simulated entry fill to the frozen structural SL. Price is rounded to exchange ticks.")
+string invalidTargetPolicy = input.string("Use R target", "Structural TP already behind entry", options = ["Use R target", "Skip setup"], group = G4, tooltip = "Skip setup rejects it before entry when detectable. A later gap that invalidates a target closes the filled trade immediately. Use R target is an explicit fallback, counted in diagnostics.")
+
+string G5 = "05 - Position sizing"
+string sizingMode = input.string("Fixed contracts", "Sizing", options = ["Fixed contracts", "Stop-risk budget"], group = G5)
+int fixedQty = input.int(1, "Fixed contracts", minval = 1, maxval = 100, group = G5)
+float maxRiskUsd = input.float(200.0, "Nominal stop-risk budget USD", minval = 1.0, step = 10.0, group = G5)
+int maxContracts = input.int(100, "Maximum contracts in budget mode", minval = 1, maxval = 1000, group = G5)
+int sizingSlippageTicks = input.int(1, "Entry-slippage estimate for sizing (match Properties)", minval = 0, maxval = 100, group = G5, tooltip = "Sizing uses trigger CLOSE plus this estimate. Actual entry is the next OPEN with Properties slippage, so gaps can change risk. Fees and exit slippage are not included in the budget.")
+
+string G6 = "06 - Display"
+bool showSetupMarkers = input.bool(true, "Show completed streaks", group = G6)
+bool showTriggerMarkers = input.bool(true, "Show submitted reversal entries", group = G6)
+bool showPendingLevels = input.bool(true, "Show both pending break levels", group = G6)
+bool showTradeLevels = input.bool(true, "Show entry / SL / TP", group = G6)
+bool showTable = input.bool(true, "Show chart-run statistics", group = G6)
+bool showDiagnostics = input.bool(true, "Show diagnostics", group = G6)
+string tableLocation = input.string("Top right", "Table position", options = ["Top right", "Bottom right", "Top left", "Bottom left"], group = G6)
+
+string TZ = "America/New_York"
+string signalTf = signalMode == "1 minute" ? "1" : "5"
+bool chartOK = timeframe.isminutes and timeframe.multiplier == 1 and chart.is_standard
+if barstate.isfirst and not chartOK
+    runtime.error("Use a STANDARD 1-minute candle chart. Select 1 minute or 5 minutes in the strategy's Signal timeframe setting.")
+
+// ============================== HELPERS ====================================
+f_in_session(int ts) =>
+    int m = hour(ts, TZ) * 60 + minute(ts, TZ)
+    int startM = sessionStartHour * 60 + sessionStartMinute
+    int endM = sessionEndHour * 60 + sessionEndMinute
+    startM == endM ? true : (startM < endM ? m >= startM and m < endM : m >= startM or m < endM)
+
+f_day(int ts) =>
+    year(ts, TZ) * 10000 + month(ts, TZ) * 100 + dayofmonth(ts, TZ)
+
+f_floor_tick(float price) =>
+    math.floor(price / syminfo.mintick + 0.0000001) * syminfo.mintick
+
+f_ceil_tick(float price) =>
+    math.ceil(price / syminfo.mintick - 0.0000001) * syminfo.mintick
+
+f_price(float price) =>
+    na(price) ? "-" : str.tostring(price, format.mintick)
+
+f_date(int ts) =>
+    na(ts) ? "-" : str.format_time(ts, "yyyy-MM-dd HH:mm", TZ)
+
+f_pf(float profit, float loss) =>
+    loss > 0 ? str.tostring(profit / loss, "#.###") : (profit > 0 ? "No losses" : "-")
+
+// History references make these counters idempotent during fill recalculations.
+// The returned tuple deliberately stays on ONE physical line.
+f_pack() =>
+    bool bull = streakDefinition == "Higher / lower closes" ? (not na(close[1]) and close > close[1]) : close > open
+    bool bear = streakDefinition == "Higher / lower closes" ? (not na(close[1]) and close < close[1]) : close < open
+    int up = 0
+    int dn = 0
+    up := bull ? nz(up[1]) + 1 : 0
+    dn := bear ? nz(dn[1]) + 1 : 0
+    float atr = ta.sma(ta.tr(true), atrLen)
+    float moveH = ta.highest(high, streakLen)
+    float moveL = ta.lowest(low, streakLen)
+    [up, dn, atr, time_close, bar_index, high, low, close, moveH, moveL, high[streakLen - 1], low[streakLen - 1], open[streakLen - 1]]
+
+[sUp, sDown, sAtr, sCloseTime, sIndex, sHigh, sLow, sClose, sMoveHigh, sMoveLow, sFirstHigh, sFirstLow, sFirstOpen] = request.security(syminfo.tickerid, signalTf, f_pack(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// ============================= PERSISTENT STATE ============================
+// varip is used for order-event state. Signals still require confirmed bars.
+varip float previousExecutionPosition = 0.0
+varip int previousExecutionClosed = 0
+varip int lastLogicBar = na
+varip int lastSignalClose = na
+varip int lastSignalIndex = na
+varip int lastLogicDay = na
+var int firstDataTime = time
+
+// One pending setup per direction. A newer same-direction setup replaces the
+// older untriggered one, AFTER the older setup gets its chance on this candle.
+varip bool armShort = false
+varip int shortSetupIndex = na
+varip float shortBreakLevel = na
+varip float shortTerminalHigh = na
+varip float shortStreakHigh = na
+varip float shortRunningHigh = na
+varip float shortFirstLow = na
+varip float shortFirstOpen = na
+
+varip bool armLong = false
+varip int longSetupIndex = na
+varip float longBreakLevel = na
+varip float longTerminalLow = na
+varip float longStreakLow = na
+varip float longRunningLow = na
+varip float longFirstHigh = na
+varip float longFirstOpen = na
+
+// Submitted market order and immutable trigger snapshot.
+varip bool awaitingEntry = false
+varip int submittedOnBar = na
+varip int pendingDirection = 0
+varip float pendingStop = na
+varip float pendingStructuralTP = na
+
+// Filled position snapshot: initialised exactly ONCE per real fill.
+varip float activeStop = na
+varip float activeTP = na
+varip float activeRiskUsd = na
+varip int activeEntryDay = na
+varip bool closingRequested = false
+
+// Diagnostics.
+varip int setupsShort = 0
+varip int setupsLong = 0
+varip int expiredCount = 0
+varip int replacedCount = 0
+varip int confirmationCount = 0
+varip int submittedCount = 0
+varip int filledCount = 0
+varip int sessionBlocked = 0
+varip int riskBlocked = 0
+varip int badStopCount = 0
+varip int badTargetCount = 0
+varip int busyBlocked = 0
+varip int unfilledRecovered = 0
+varip int gapInvalidCount = 0
+varip int fallbackCount = 0
+varip int riskOverBudget = 0
+varip int firstFillTime = na
+varip int lastFillTime = na
+varip int shortSetupMarkerBar = na
+varip int longSetupMarkerBar = na
+varip int shortOrderMarkerBar = na
+varip int longOrderMarkerBar = na
+
+// Closed-trade ledger. The R denominator is the frozen initial stop risk.
+varip int closedProcessed = 0
+varip float ledgerNetUsd = 0.0
+varip float netR = 0.0
+varip float grossWinR = 0.0
+varip float grossLossR = 0.0
+varip int rTrades = 0
+varip int rMissing = 0
+varip int consecutiveLosses = 0
+varip int maxConsecutiveLosses = 0
+
+bool fillExecution = strategy.position_size != previousExecutionPosition or strategy.closedtrades != previousExecutionClosed
+
+// ======================= CLOSED TRADE EVENT FIRST ===========================
+if strategy.closedtrades > closedProcessed
+    for tradeNo = closedProcessed to strategy.closedtrades - 1
+        // Account is USD. size() is signed, so this also handles SHORT profits.
+        float pricePnl = (strategy.closedtrades.exit_price(tradeNo) - strategy.closedtrades.entry_price(tradeNo)) * strategy.closedtrades.size(tradeNo) * syminfo.pointvalue
+        float tradeNet = pricePnl - strategy.closedtrades.commission(tradeNo)
+        ledgerNetUsd += tradeNet
+        if not na(activeRiskUsd) and activeRiskUsd > 0
+            float rr = tradeNet / activeRiskUsd
+            netR += rr
+            grossWinR += math.max(rr, 0)
+            grossLossR += math.max(-rr, 0)
+            rTrades += 1
+        else
+            rMissing += 1
+        consecutiveLosses := tradeNet < 0 ? consecutiveLosses + 1 : 0
+        maxConsecutiveLosses := math.max(maxConsecutiveLosses, consecutiveLosses)
+    closedProcessed := strategy.closedtrades
+    if strategy.position_size == 0
+        // Also handles entry and exit occurring inside ONE chart candle.
+        awaitingEntry := false
+        submittedOnBar := na
+        pendingDirection := 0
+        pendingStop := na
+        pendingStructuralTP := na
+        activeStop := na
+        activeTP := na
+        activeRiskUsd := na
+        activeEntryDay := na
+        closingRequested := false
+
+// ======================== ACTUAL ENTRY FILL EVENT ==========================
+if awaitingEntry and strategy.position_size != 0
+    int direction = strategy.position_size > 0 ? 1 : -1
+    float fillPrice = strategy.position_avg_price
+    activeStop := pendingStop
+    float riskPoints = direction * (fillPrice - activeStop)
+    bool stopValid = not na(activeStop) and riskPoints >= syminfo.mintick * 0.5 and direction == pendingDirection
+    activeEntryDay := f_day(strategy.opentrades.entry_time(0))
+    int filledAt = strategy.opentrades.entry_time(0)
+    firstFillTime := na(firstFillTime) ? filledAt : firstFillTime
+    lastFillTime := filledAt
+    filledCount += 1
+    if stopValid
+        activeRiskUsd := riskPoints * syminfo.pointvalue * math.abs(strategy.position_size)
+        if sizingMode == "Stop-risk budget" and activeRiskUsd > maxRiskUsd + 0.01
+            riskOverBudget += 1
+        bool structuralValid = not na(pendingStructuralTP) and direction * (pendingStructuralTP - fillPrice) >= syminfo.mintick * 0.5
+        bool useRTarget = tpMode == "R multiple" or (not structuralValid and invalidTargetPolicy == "Use R target")
+        if useRTarget
+            float rawRTarget = fillPrice + direction * riskPoints * tpR
+            activeTP := direction > 0 ? f_ceil_tick(rawRTarget) : f_floor_tick(rawRTarget)
+            if tpMode != "R multiple"
+                fallbackCount += 1
+        else if structuralValid
+            activeTP := math.round_to_mintick(pendingStructuralTP)
+        else
+            // Do not silently move a structural target across the entry.
+            gapInvalidCount += 1
+            closingRequested := true
+            strategy.close_all(comment = "INVALID TARGET AFTER GAP", immediately = true)
+    else
+        // Do not manufacture a one-tick SL when a gap invalidates the real SL.
+        activeRiskUsd := na
+        gapInvalidCount += 1
+        closingRequested := true
+        strategy.close_all(comment = "INVALID STOP AFTER GAP", immediately = true)
+    awaitingEntry := false
+    submittedOnBar := na
+    pendingDirection := 0
+    pendingStop := na
+    pendingStructuralTP := na
+
+// SL/TP remain FROZEN; this block never recalculates levels from new candles.
+if strategy.position_size > 0 and not closingRequested and not na(activeStop) and not na(activeTP)
+    strategy.exit("L-X", from_entry = "L", stop = activeStop, limit = activeTP, comment_loss = "SL", comment_profit = "TP")
+if strategy.position_size < 0 and not closingRequested and not na(activeStop) and not na(activeTP)
+    strategy.exit("S-X", from_entry = "S", stop = activeStop, limit = activeTP, comment_loss = "SL", comment_profit = "TP")
+
+// ========================= BAR-CLOSE LOGIC ONLY =============================
+// A fill pass may expose historical OHLC before that candle actually closes.
+// Never use those prices to create another entry during a fill execution.
+bool normalClosePass = barstate.isconfirmed and not fillExecution and (na(lastLogicBar) or lastLogicBar != bar_index)
+if normalClosePass
+    lastLogicBar := bar_index
+
+    // A market entry should fill on the next available chart bar. If it did
+    // not, cancel it and unlock the state instead of waiting forever.
+    if awaitingEntry and strategy.position_size == 0 and bar_index > submittedOnBar
+        strategy.cancel("L")
+        strategy.cancel("S")
+        strategy.cancel("L-X")
+        strategy.cancel("S-X")
+        awaitingEntry := false
+        submittedOnBar := na
+        pendingDirection := 0
+        pendingStop := na
+        pendingStructuralTP := na
+        unfilledRecovered += 1
+
+    int currentDay = f_day(time_close)
+    bool newDay = not na(lastLogicDay) and currentDay != lastLogicDay
+    if newDay
+        armLong := false
+        armShort := false
+    lastLogicDay := currentDay
+
+    int flatTs = timestamp(TZ, year(time_close, TZ), month(time_close, TZ), dayofmonth(time_close, TZ), hardFlatHour, hardFlatMinute)
+    bool afterHardFlat = hardFlatEnabled and time_close >= flatTs
+    bool carriedFromPriorDay = hardFlatEnabled and strategy.position_size != 0 and not na(activeEntryDay) and activeEntryDay != currentDay
+    if afterHardFlat or carriedFromPriorDay
+        armLong := false
+        armShort := false
+        if strategy.position_size != 0 and not closingRequested
+            closingRequested := true
+            strategy.close_all(comment = "HARD FLAT", immediately = true)
+
+    // Critical HTF check: only process the 5m candle on the 1m candle that
+    // actually closes it (e.g. 09:34-09:35), never on its first developing minute.
+    bool confirmedSignalClose = time_close == sCloseTime and (na(lastSignalClose) or sCloseTime != lastSignalClose)
+    if confirmedSignalClose
+        lastSignalClose := sCloseTime
+        lastSignalIndex := sIndex
+        bool warmupOK = sIndex >= math.max(atrLen, streakLen - 1) and not na(sAtr)
+        bool setupSessionOK = not useSessionFilter or f_in_session(sCloseTime)
+        bool entrySessionOK = not useSessionFilter or not triggerMustBeInSession or f_in_session(sCloseTime)
+        bool flatNow = strategy.position_size == 0 and not awaitingEntry and not closingRequested
+
+        int shortAge = armShort ? sIndex - shortSetupIndex : 0
+        int longAge = armLong ? sIndex - longSetupIndex : 0
+        if armShort
+            shortRunningHigh := math.max(shortRunningHigh, sHigh)
+            if shortAge > waitBars
+                armShort := false
+                expiredCount += 1
+        if armLong
+            longRunningLow := math.min(longRunningLow, sLow)
+            if longAge > waitBars
+                armLong := false
+                expiredCount += 1
+
+        bool shortBreak = armShort and shortAge >= 1 and shortAge <= waitBars and sClose < shortBreakLevel
+        bool longBreak = armLong and longAge >= 1 and longAge <= waitBars and sClose > longBreakLevel
+        if shortBreak
+            confirmationCount += 1
+        if longBreak
+            confirmationCount += 1
+
+        // If both opposite setups confirm on one candle, the NEWER setup wins.
+        // There is no implicit SHORT-first bias.
+        int direction = 0
+        if shortBreak and longBreak
+            direction := shortSetupIndex > longSetupIndex ? -1 : 1
+        else if shortBreak
+            direction := -1
+        else if longBreak
+            direction := 1
+
+        if direction != 0
+            bool enabledDirection = direction > 0 ? allowLongs : allowShorts
+            if not flatNow
+                busyBlocked += 1
+            else if not entrySessionOK or afterHardFlat or carriedFromPriorDay
+                sessionBlocked += 1
+            else if enabledDirection and warmupOK
+                float rawStop = na
+                if slMode == "Trigger candle extreme"
+                    rawStop := direction > 0 ? sLow : sHigh
+                else if slMode == "Terminal streak candle extreme"
+                    rawStop := direction > 0 ? longTerminalLow : shortTerminalHigh
+                else if slMode == "Whole streak extreme"
+                    rawStop := direction > 0 ? longStreakLow : shortStreakHigh
+                else if slMode == "Whole move through trigger"
+                    rawStop := direction > 0 ? longRunningLow : shortRunningHigh
+                else
+                    rawStop := sClose - direction * sAtr * atrMult
+                rawStop -= direction * stopBufferTicks * syminfo.mintick
+                float plannedStop = direction > 0 ? f_floor_tick(rawStop) : f_ceil_tick(rawStop)
+                float estimatedFill = sClose + direction * sizingSlippageTicks * syminfo.mintick
+                float estimatedRiskPoints = direction * (estimatedFill - plannedStop)
+                float structuralTP = na
+                if tpMode == "First streak candle extreme"
+                    structuralTP := direction > 0 ? longFirstHigh : shortFirstLow
+                else if tpMode == "First streak candle open"
+                    structuralTP := direction > 0 ? longFirstOpen : shortFirstOpen
+                bool stopValid = not na(plannedStop) and estimatedRiskPoints >= syminfo.mintick * 0.5
+                bool targetValid = tpMode == "R multiple" or invalidTargetPolicy == "Use R target" or (not na(structuralTP) and direction * (structuralTP - estimatedFill) >= syminfo.mintick * 0.5)
+                float qty = fixedQty
+                if sizingMode == "Stop-risk budget"
+                    float unitRisk = estimatedRiskPoints * syminfo.pointvalue
+                    qty := stopValid and unitRisk > 0 ? math.min(maxContracts, math.floor(maxRiskUsd / unitRisk)) : 0
+                if not stopValid
+                    badStopCount += 1
+                else if not targetValid
+                    badTargetCount += 1
+                else if qty < 1
+                    riskBlocked += 1
+                else
+                    awaitingEntry := true
+                    submittedOnBar := bar_index
+                    pendingDirection := direction
+                    pendingStop := plannedStop
+                    pendingStructuralTP := structuralTP
+                    submittedCount += 1
+                    if direction > 0
+                        longOrderMarkerBar := bar_index
+                        strategy.entry("L", strategy.long, qty = qty, comment = "Bear streak failure LONG")
+                        // Protective SL submitted with entry; TP is set from
+                        // the actual fill on the fill-management execution.
+                        strategy.exit("L-X", from_entry = "L", stop = plannedStop, comment_loss = "SL")
+                    else
+                        shortOrderMarkerBar := bar_index
+                        strategy.entry("S", strategy.short, qty = qty, comment = "Bull streak failure SHORT")
+                        strategy.exit("S-X", from_entry = "S", stop = plannedStop, comment_loss = "SL")
+                    armLong := false
+                    armShort := false
+
+        // The first break consumes a setup even when a filter rejects entry.
+        // No later reuse of an already-failed setup.
+        if shortBreak
+            armShort := false
+        if longBreak
+            armLong := false
+        // Last allowed candle was checked above; only now expire the setup.
+        if armShort and shortAge >= waitBars
+            armShort := false
+            expiredCount += 1
+        if armLong and longAge >= waitBars
+            armLong := false
+            expiredCount += 1
+
+        // Streaks continue to be measured while a trade is open, but setups
+        // completing during an open position are not queued for later entry.
+        bool canArm = strategy.position_size == 0 and not awaitingEntry and not closingRequested and not afterHardFlat and not carriedFromPriorDay and setupSessionOK and warmupOK
+        if canArm and sUp == streakLen and allowShorts
+            if armShort
+                replacedCount += 1
+            armShort := true
+            shortSetupIndex := sIndex
+            shortBreakLevel := sLow
+            shortTerminalHigh := sHigh
+            shortStreakHigh := sMoveHigh
+            shortRunningHigh := sMoveHigh
+            shortFirstLow := sFirstLow
+            shortFirstOpen := sFirstOpen
+            setupsShort += 1
+            shortSetupMarkerBar := bar_index
+        if canArm and sDown == streakLen and allowLongs
+            if armLong
+                replacedCount += 1
+            armLong := true
+            longSetupIndex := sIndex
+            longBreakLevel := sHigh
+            longTerminalLow := sLow
+            longStreakLow := sMoveLow
+            longRunningLow := sMoveLow
+            longFirstHigh := sFirstHigh
+            longFirstOpen := sFirstOpen
+            setupsLong += 1
+            longSetupMarkerBar := bar_index
+
+// ============================== VISUALS ====================================
+plotshape(showSetupMarkers and bar_index == shortSetupMarkerBar, title = "Bull streak: arm SHORT", style = shape.circle, location = location.abovebar, color = color.orange, size = size.tiny, text = "ARM S", textcolor = chart.fg_color)
+plotshape(showSetupMarkers and bar_index == longSetupMarkerBar, title = "Bear streak: arm LONG", style = shape.circle, location = location.belowbar, color = color.aqua, size = size.tiny, text = "ARM L", textcolor = chart.fg_color)
+plotshape(showTriggerMarkers and bar_index == shortOrderMarkerBar, title = "SHORT order submitted", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small, text = "SHORT", textcolor = chart.fg_color)
+plotshape(showTriggerMarkers and bar_index == longOrderMarkerBar, title = "LONG order submitted", style = shape.triangleup, location = location.belowbar, color = color.green, size = size.small, text = "LONG", textcolor = chart.fg_color)
+plot(showPendingLevels and armShort ? shortBreakLevel : na, title = "SHORT confirmation: close below", color = color.orange, linewidth = 2, style = plot.style_linebr)
+plot(showPendingLevels and armLong ? longBreakLevel : na, title = "LONG confirmation: close above", color = color.aqua, linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels and strategy.position_size != 0 ? strategy.position_avg_price : na, title = "Entry fill", color = color.blue, linewidth = 1, style = plot.style_linebr)
+plot(showTradeLevels and strategy.position_size != 0 ? activeStop : na, title = "Frozen SL", color = color.red, linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels and strategy.position_size != 0 ? activeTP : na, title = "Frozen TP", color = color.green, linewidth = 2, style = plot.style_linebr)
+
+// ======================== CHART-RUN STATISTICS ==============================
+float winRate = strategy.closedtrades > 0 ? 100.0 * strategy.wintrades / strategy.closedtrades : na
+float avgWin = strategy.wintrades > 0 ? strategy.grossprofit / strategy.wintrades : na
+float avgLoss = strategy.losstrades > 0 ? math.abs(strategy.grossloss) / strategy.losstrades : na
+float expectancyR = rTrades > 0 ? netR / rTrades : na
+string tablePos = tableLocation == "Top right" ? position.top_right : tableLocation == "Bottom right" ? position.bottom_right : tableLocation == "Top left" ? position.top_left : position.bottom_left
+var table stats = table.new(tablePos, 2, 31, bgcolor = chart.bg_color, frame_color = color.new(chart.fg_color, 65), frame_width = 1)
+
+f_row(table t, int row, string caption, string value) =>
+    table.cell(t, 0, row, caption, text_color = chart.fg_color, bgcolor = chart.bg_color, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, row, value, text_color = chart.fg_color, bgcolor = chart.bg_color, text_size = size.small, text_halign = text.align_right)
+
+if barstate.islast
+    table.clear(stats, 0, 0, 1, 30)
+    if showTable
+        f_row(stats, 0, "HERMAN - REVERSAL v3", "CHART RUN, not Deep")
+        f_row(stats, 1, syminfo.ticker + " | chart 1m", "Signal " + signalMode)
+        f_row(stats, 2, "Definition", streakDefinition)
+        f_row(stats, 3, "Streak / window", str.tostring(streakLen) + " / " + str.tostring(waitBars))
+        f_row(stats, 4, "Closed / open", str.tostring(strategy.closedtrades) + " / " + str.tostring(strategy.opentrades))
+        f_row(stats, 5, "Win rate | W / L", (na(winRate) ? "-" : str.tostring(winRate, "#.##") + "%") + " | " + str.tostring(strategy.wintrades) + " / " + str.tostring(strategy.losstrades))
+        f_row(stats, 6, "Profit factor USD", f_pf(strategy.grossprofit, math.abs(strategy.grossloss)))
+        f_row(stats, 7, "Net P&L USD", str.tostring(strategy.netprofit, "#.##"))
+        f_row(stats, 8, "Max drawdown USD", str.tostring(strategy.max_drawdown, "#.##"))
+        f_row(stats, 9, "Avg win / loss USD", (na(avgWin) ? "-" : str.tostring(avgWin, "#.##")) + " / " + (na(avgLoss) ? "-" : str.tostring(avgLoss, "#.##")))
+        f_row(stats, 10, "Net R / expectancy R", str.tostring(netR, "#.##") + " / " + (na(expectancyR) ? "-" : str.tostring(expectancyR, "#.###")))
+        f_row(stats, 11, "PF in R / max loss streak", f_pf(grossWinR, grossLossR) + " / " + str.tostring(maxConsecutiveLosses))
+        f_row(stats, 12, "State", strategy.position_size != 0 ? (closingRequested ? "CLOSING" : "IN TRADE") : (awaitingEntry ? "ORDER PENDING" : "READY"))
+        f_row(stats, 13, "SL / TP", f_price(activeStop) + " / " + f_price(activeTP))
+        if showDiagnostics
+            f_row(stats, 14, "Setups LONG / SHORT", str.tostring(setupsLong) + " / " + str.tostring(setupsShort))
+            f_row(stats, 15, "Breaks / orders / fills", str.tostring(confirmationCount) + " / " + str.tostring(submittedCount) + " / " + str.tostring(filledCount))
+            f_row(stats, 16, "Expired / replaced", str.tostring(expiredCount) + " / " + str.tostring(replacedCount))
+            f_row(stats, 17, "Blocked: session / busy", str.tostring(sessionBlocked) + " / " + str.tostring(busyBlocked))
+            f_row(stats, 18, "Blocked: risk / SL / TP", str.tostring(riskBlocked) + " / " + str.tostring(badStopCount) + " / " + str.tostring(badTargetCount))
+            f_row(stats, 19, "Unfilled orders unlocked", str.tostring(unfilledRecovered))
+            f_row(stats, 20, "Invalid gaps / R fallbacks", str.tostring(gapInvalidCount) + " / " + str.tostring(fallbackCount))
+            f_row(stats, 21, "Fills over sizing budget", str.tostring(riskOverBudget))
+            f_row(stats, 22, "R accounted / missing", str.tostring(rTrades) + " / " + str.tostring(rMissing))
+            f_row(stats, 23, "P&L ledger vs Tester", math.abs(ledgerNetUsd - strategy.netprofit) < 0.01 ? "OK" : "CHECK " + str.tostring(ledgerNetUsd - strategy.netprofit, "#.##"))
+            f_row(stats, 24, "First chart data (ET)", f_date(firstDataTime))
+            f_row(stats, 25, "Last signal bar (ET)", f_date(lastSignalClose))
+            f_row(stats, 26, "First / last entry ET", f_date(firstFillTime) + "\n" + f_date(lastFillTime))
+            f_row(stats, 27, "LONG arm age / SHORT", (armLong ? str.tostring(lastSignalIndex - longSetupIndex) : "-") + " / " + (armShort ? str.tostring(lastSignalIndex - shortSetupIndex) : "-"))
+            f_row(stats, 28, "Sizing", sizingMode == "Fixed contracts" ? str.tostring(fixedQty) + " contract(s)" : "Budget $" + str.tostring(maxRiskUsd, "#.##"))
+            f_row(stats, 29, "Session / hard flat", (useSessionFilter ? "ON" : "OFF") + " / " + (hardFlatEnabled ? "ON" : "OFF"))
+            f_row(stats, 30, "Deep results", "Read Strategy Tester report")
+
+// Always remember the broker state at the END of this execution, not the
+// previous candle's position_size. This is what prevents the v2 deadlock.
+previousExecutionPosition := strategy.position_size
+previousExecutionClosed := strategy.closedtrades
